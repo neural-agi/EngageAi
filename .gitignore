@@ -1,0 +1,6 @@
+# TODO: refine ignore rules for the repository
+.env
+.venv/
+__pycache__/
+node_modules/
+.next/
