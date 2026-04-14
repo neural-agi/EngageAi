@@ -2,8 +2,19 @@ export type ApiRequestOptions = RequestInit & {
   path: string;
 };
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ?? "";
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY;
+
+
+function getApiBaseUrl(): string {
+  if (!API_BASE_URL) {
+    throw new Error(
+      "NEXT_PUBLIC_API_BASE_URL is not configured. Set it in the frontend environment before making API requests.",
+    );
+  }
+
+  return API_BASE_URL.replace(/\/+$/, "");
+}
 
 export type RunPipelineInput = {
   accountId: string;
@@ -62,7 +73,8 @@ export type ExecutionHistoryItem = {
 export async function apiRequest<T>(options: ApiRequestOptions): Promise<T> {
   try {
     const { path, headers, ...requestOptions } = options;
-    const fullUrl = `${API_BASE_URL}${path}`;
+    const baseUrl = getApiBaseUrl();
+    const fullUrl = `${baseUrl}${path}`;
 
     console.log("Calling API:", fullUrl);
 

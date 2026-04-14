@@ -26,7 +26,20 @@ async def lifespan(app: FastAPI):
 
     settings = get_settings()
     configure_logging(settings.log_level)
-    validated_settings = validate_required_settings(settings)
+    logger.info(
+        "Loading backend environment configuration",
+        extra={"environment": settings.environment},
+    )
+
+    try:
+        validated_settings = validate_required_settings(settings)
+    except RuntimeError as exc:
+        logger.error(
+            "Backend startup aborted due to invalid environment configuration",
+            extra={"error": str(exc)},
+        )
+        raise
+
     app.state.settings = validated_settings
 
     try:

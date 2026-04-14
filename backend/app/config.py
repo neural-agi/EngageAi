@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     backend_host: str = Field(default="0.0.0.0")
     backend_port: int = Field(default=8000)
-    backend_cors_origins: str = Field(default="http://localhost:3000")
+    backend_cors_origins: str = Field(default="")
     api_key: str | None = Field(default=None)
     api_rate_limit_per_minute: int = Field(default=60)
 
@@ -58,12 +58,19 @@ def validate_required_settings(settings: Settings | None = None) -> Settings:
         missing_variables.append("SESSION_MANAGER_SECRET")
     if not settings.api_key:
         missing_variables.append("API_KEY")
-    if settings.environment.strip().lower() == "production" and not settings.database_url:
-        missing_variables.append("DATABASE_URL")
+    environment = settings.environment.strip().lower()
+    if environment == "production":
+        if not settings.database_url:
+            missing_variables.append("DATABASE_URL")
+        if not settings.backend_cors_origins.strip():
+            missing_variables.append("BACKEND_CORS_ORIGINS")
 
     if missing_variables:
         missing = ", ".join(missing_variables)
-        raise RuntimeError(f"Missing required environment variables: {missing}")
+        raise RuntimeError(
+            "Missing required environment variables: "
+            f"{missing}. Set them in the deployment environment or .env file."
+        )
 
     return settings
 
@@ -72,8 +79,9 @@ def get_cors_origins(settings: Settings | None = None) -> list[str]:
     """Return a normalized list of configured CORS origins."""
 
     settings = settings or get_settings()
-    return [
+    configured_origins = [
         origin.strip()
         for origin in settings.backend_cors_origins.split(",")
         if origin.strip()
     ]
+    return configured_origins
