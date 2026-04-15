@@ -48,8 +48,9 @@ class AIProvider:
         cleaned_prompt = prompt.strip()
         if not cleaned_prompt:
             return ""
-        if self._client is None:
+        if self.disabled:
             return cleaned_prompt
+        self._require_client()
 
         logger.info("Generating text with configured LLM provider", extra={"provider": self.llm_provider})
 
@@ -62,7 +63,7 @@ class AIProvider:
 
         return await self._run_with_retry(
             operation=operation,
-            fallback=lambda: cleaned_prompt,
+            operation_name="generate_text",
             max_attempts=max_attempts,
         )
 
@@ -72,8 +73,9 @@ class AIProvider:
         cleaned_prompt = prompt.strip()
         if not cleaned_prompt:
             return {}
-        if self._client is None:
+        if self.disabled:
             return {"content": cleaned_prompt}
+        self._require_client()
 
         structured_prompt = (
             "Return a valid JSON object only. Do not wrap the response in markdown fences.\n\n"
@@ -86,8 +88,9 @@ class AIProvider:
         """Return an embedding vector for an input string."""
 
         cleaned_text = text.strip()
-        if not cleaned_text or self._client is None:
+        if not cleaned_text or self.disabled:
             return []
+        self._require_client()
 
         logger.info("Generating embeddings with configured LLM provider", extra={"provider": self.llm_provider})
 
@@ -100,7 +103,7 @@ class AIProvider:
 
         return await self._run_with_retry(
             operation=operation,
-            fallback=list,
+            operation_name="get_embedding",
             max_attempts=max_attempts,
         )
 
@@ -112,20 +115,33 @@ class AIProvider:
 
         if self.llm_provider == "gemini":
             if not self.settings.gemini_api_key:
+                logger.warning("Gemini provider selected without GEMINI_API_KEY")
                 return None
             client = GeminiClient(
                 self.settings.gemini_api_key,
                 model=self.settings.gemini_model,
                 embedding_model=self.settings.gemini_embedding_model,
             )
+            if not client.is_available:
+                logger.warning("Gemini SDK is unavailable", extra={"provider": self.llm_provider})
             return client if client.is_available else None
 
         if AsyncOpenAI is None or not self.settings.openai_api_key:
+            logger.warning("OpenAI provider unavailable", extra={"provider": self.llm_provider})
             return None
         client_kwargs: dict[str, Any] = {"api_key": self.settings.openai_api_key}
         if self.settings.openai_base_url:
             client_kwargs["base_url"] = self.settings.openai_base_url
         return AsyncOpenAI(**client_kwargs)
+
+    def _require_client(self) -> None:
+        """Ensure a concrete provider client exists before making external calls."""
+
+        if self._client is not None:
+            return
+        raise RuntimeError(
+            f"LLM provider '{self.llm_provider}' is not configured or its SDK is unavailable."
+        )
 
     def _build_openai_text_operation(self, prompt: str) -> Callable[[], Awaitable[str]]:
         """Build the async OpenAI text operation."""
@@ -172,7 +188,7 @@ class AIProvider:
     async def _run_with_retry(
         self,
         operation: Callable[[], Awaitable[T]],
-        fallback: Callable[[], T],
+        operation_name: str,
         max_attempts: int | None = None,
     ) -> T:
         """Run an async operation with basic retries and timeout handling."""
@@ -182,13 +198,23 @@ class AIProvider:
 
         for attempt in range(attempts):
             try:
-                return await asyncio.wait_for(operation(), timeout=self.timeout_seconds)
+                result = await asyncio.wait_for(operation(), timeout=self.timeout_seconds)
+                logger.info(
+                    "LLM provider call succeeded",
+                    extra={
+                        "provider": self.llm_provider,
+                        "operation": operation_name,
+                        "attempt": attempt + 1,
+                    },
+                )
+                return result
             except Exception as exc:  # pragma: no cover - depends on provider/runtime behavior
                 last_error = exc
                 logger.warning(
                     "LLM provider call failed",
                     extra={
                         "provider": self.llm_provider,
+                        "operation": operation_name,
                         "attempt": attempt + 1,
                         "max_attempts": attempts,
                         "error": str(exc),
@@ -199,13 +225,18 @@ class AIProvider:
                 await asyncio.sleep(min(2**attempt, 3))
 
         logger.error(
-            "Falling back after LLM provider failure",
+            "LLM provider call exhausted retries",
             extra={
                 "provider": self.llm_provider,
+                "operation": operation_name,
+                "retry_count": attempts,
                 "error": str(last_error) if last_error is not None else "unknown",
             },
         )
-        return fallback()
+        raise RuntimeError(
+            f"{self.llm_provider} {operation_name} failed after {attempts} attempts: "
+            f"{str(last_error) if last_error is not None else 'unknown error'}"
+        ) from last_error
 
     def _parse_json_object(self, content: str) -> dict[str, Any]:
         """Parse a JSON object response into a clean dictionary."""

@@ -112,7 +112,9 @@ class EngagementPipeline:
             logger.info("No posts available for pipeline processing", extra={"account_id": account_id})
             return []
 
+        logger.info("Posts fetched: %s", len(posts), extra={"account_id": account_id, "count": len(posts)})
         results: list[dict[str, Any]] = []
+        posts_after_filtering = 0
 
         for index, post in enumerate(posts, start=1):
             if not isinstance(post, dict):
@@ -141,6 +143,7 @@ class EngagementPipeline:
                         extra={"post_index": index, "analysis": analysis},
                     )
                     continue
+                posts_after_filtering += 1
 
                 logger.info("Generating comment variants", extra={"post_index": index})
                 variants = await self.writer.draft(
@@ -200,6 +203,11 @@ class EngagementPipeline:
                 logger.exception("Failed to process post", extra={"post_index": index})
                 continue
 
+        logger.info(
+            "Posts after filtering: %s",
+            posts_after_filtering,
+            extra={"account_id": account_id, "count": posts_after_filtering},
+        )
         logger.info(
             "Engagement pipeline completed",
             extra={"account_id": account_id, "processed_results": len(results)},

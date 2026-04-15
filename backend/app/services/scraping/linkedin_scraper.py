@@ -45,7 +45,7 @@ class LinkedInScraper:
 
         self.session_cookies = session_cookies
         self.proxy = proxy
-        self.selectors = selectors or {}
+        self.selectors = {**self._default_selectors(), **(selectors or {})}
         self.headless = headless
         self.timeout_ms = timeout_ms
 
@@ -76,12 +76,14 @@ class LinkedInScraper:
             "post_link",
         )
         if async_playwright is None:
-            logger.warning("Playwright unavailable; using placeholder real feed data")
-            return await self.fetch_placeholder_real_data(max_posts=max_posts)
+            logger.warning(
+                "Playwright unavailable for real scraping. Install it with 'pip install playwright' and 'playwright install'."
+            )
+            raise RuntimeError("Playwright is not installed for real scraping.")
 
         if not self._has_required_selectors(required_selectors):
-            logger.warning("LinkedIn selectors missing; using placeholder real feed data")
-            return await self.fetch_placeholder_real_data(max_posts=max_posts)
+            logger.warning("LinkedIn selectors are missing for real scraping")
+            raise RuntimeError("LinkedIn scraper selectors are not configured.")
 
         logger.info("Fetching LinkedIn feed posts", extra={"max_posts": max_posts})
         try:
@@ -92,16 +94,23 @@ class LinkedInScraper:
                     post_selector=self.selectors["feed_post"],
                     max_posts=max_posts,
                 )
-                logger.info("Fetched LinkedIn feed posts", extra={"count": len(posts)})
+                logger.info(
+                    "Posts fetched: %s",
+                    len(posts),
+                    extra={"count": len(posts), "source": "real"},
+                )
                 return posts
-        except Exception:
-            logger.exception("Failed to fetch LinkedIn feed; using placeholder real feed data")
-            return await self.fetch_placeholder_real_data(max_posts=max_posts)
+        except Exception as exc:
+            logger.exception(
+                "Failed to fetch LinkedIn feed",
+                extra={"error": str(exc), "source": "real"},
+            )
+            raise
 
     async def fetch_placeholder_real_data(self, max_posts: int = 20) -> list[dict[str, Any]]:
         """Return structured placeholder posts until real selectors are fully configured."""
 
-        logger.info("Using placeholder real feed data", extra={"max_posts": max_posts})
+        logger.info("Using placeholder real feed data", extra={"max_posts": max_posts, "source": "placeholder"})
 
         placeholder_posts = [
             {
@@ -160,7 +169,13 @@ class LinkedInScraper:
             },
         ]
 
-        return placeholder_posts[:max_posts]
+        selected_posts = placeholder_posts[:max_posts]
+        logger.info(
+            "Posts fetched: %s",
+            len(selected_posts),
+            extra={"count": len(selected_posts), "source": "placeholder"},
+        )
+        return selected_posts
 
     async def fetch_creator_posts(
         self,
@@ -418,6 +433,38 @@ class LinkedInScraper:
         """Sleep for a randomized interval to avoid robotic interaction timing."""
 
         await asyncio.sleep(random.uniform(minimum, maximum))
+
+    def _default_selectors(self) -> dict[str, str]:
+        """Return a best-effort selector map for current LinkedIn layouts."""
+
+        return {
+            "feed_post": "div.feed-shared-update-v2, article[data-id]",
+            "creator_post": "div.feed-shared-update-v2, article[data-id]",
+            "post_author": (
+                ".update-components-actor__title span[dir='ltr'], "
+                ".update-components-actor__name span[dir='ltr'], "
+                "span.update-components-actor__name"
+            ),
+            "post_content": (
+                ".update-components-text span[dir='ltr'], "
+                ".feed-shared-inline-show-more-text span[dir='ltr'], "
+                ".break-words span[dir='ltr']"
+            ),
+            "post_likes": (
+                "button[aria-label*='reaction'], "
+                "button[aria-label*='like'], "
+                ".social-details-social-counts__reactions-count"
+            ),
+            "post_comments": (
+                "button[aria-label*='comment'], "
+                ".social-details-social-counts__comments"
+            ),
+            "post_link": "a.app-aware-link[href*='/posts/'], a[href*='/feed/update/']",
+            "creator_posts_tab": "a[href*='recent-activity/shares'], a[href*='recent-activity/all/']",
+            "comment_button": "button[aria-label*='Comment'], button[aria-label*='comment']",
+            "comment_input": "div[role='textbox'][contenteditable='true']",
+            "comment_submit": "button.comments-comment-box__submit-button--cr, button[aria-label='Post comment']",
+        }
 
     def _has_required_selectors(self, keys: tuple[str, ...]) -> bool:
         """Check that all required selector keys are configured."""

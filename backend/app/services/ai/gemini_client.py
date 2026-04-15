@@ -5,26 +5,27 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    import google.generativeai as genai
+    from google import genai
 except ImportError:  # pragma: no cover - optional dependency fallback
     genai = None
 
 
 class GeminiClient:
-    """Minimal sync wrapper around the Google Generative AI SDK."""
+    """Minimal sync wrapper around the Google GenAI SDK."""
 
     def __init__(
         self,
         api_key: str,
         *,
-        model: str = "gemini-1.5-flash",
-        embedding_model: str = "models/text-embedding-004",
+        model: str = "gemini-2.0-flash",
+        embedding_model: str = "text-embedding-004",
     ) -> None:
         """Store Gemini configuration for generation and embeddings."""
 
         self.api_key = api_key.strip()
         self.model = model
         self.embedding_model = embedding_model
+        self._client: Any | None = None
 
     @property
     def is_available(self) -> bool:
@@ -35,49 +36,58 @@ class GeminiClient:
     def generate_text(self, prompt: str) -> str:
         """Generate plain text from Gemini."""
 
-        self._configure()
-        model = genai.GenerativeModel(self.model)
-        response = model.generate_content(prompt)
-        return self._extract_text(response).strip()
-
-    def get_embedding(self, text: str) -> list[float]:
-        """Return an embedding vector using Gemini-compatible embedding APIs."""
-
-        self._configure()
-        response = genai.embed_content(
-            model=self.embedding_model,
-            content=text,
-            task_type="retrieval_document",
+        client = self._get_client()
+        response = client.models.generate_content(
+            model=self.model,
+            contents=prompt,
         )
-        embedding = response.get("embedding", []) if isinstance(response, dict) else []
-        return [float(value) for value in embedding]
-
-    def _configure(self) -> None:
-        """Configure the Gemini SDK and verify availability."""
-
-        if genai is None or not self.api_key:
-            raise RuntimeError("Google Generative AI SDK is unavailable or GEMINI_API_KEY is missing.")
-        genai.configure(api_key=self.api_key)
-
-    def _extract_text(self, response: Any) -> str:
-        """Extract plain text from a Gemini response payload."""
-
         response_text = getattr(response, "text", None)
         if isinstance(response_text, str) and response_text.strip():
-            return response_text
+            return response_text.strip()
+        raise RuntimeError("Gemini response did not include text output.")
 
-        candidates = getattr(response, "candidates", None)
-        if not isinstance(candidates, list):
-            return ""
+    def get_embedding(self, text: str) -> list[float]:
+        """Return an embedding vector when the SDK provides one cleanly."""
 
-        text_parts: list[str] = []
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None)
-            if not isinstance(parts, list):
-                continue
-            for part in parts:
-                part_text = getattr(part, "text", None)
-                if isinstance(part_text, str) and part_text.strip():
-                    text_parts.append(part_text.strip())
-        return "\n".join(text_parts)
+        client = self._get_client()
+        response = client.models.embed_content(
+            model=self.embedding_model,
+            contents=text,
+        )
+        embedding = self._extract_embedding(response)
+        if not embedding:
+            raise RuntimeError("Gemini embedding response did not include usable values.")
+        return embedding
+
+    def _get_client(self) -> Any:
+        """Return an initialized Gemini client."""
+
+        if genai is None or not self.api_key:
+            raise RuntimeError("Google GenAI SDK is unavailable or GEMINI_API_KEY is missing.")
+        if self._client is None:
+            self._client = genai.Client(api_key=self.api_key)
+        return self._client
+
+    def _extract_embedding(self, response: Any) -> list[float]:
+        """Extract embedding values from multiple SDK response shapes."""
+
+        direct_embedding = getattr(response, "embedding", None)
+        direct_values = getattr(direct_embedding, "values", None)
+        if isinstance(direct_values, list):
+            return [float(value) for value in direct_values]
+
+        embeddings = getattr(response, "embeddings", None)
+        if isinstance(embeddings, list) and embeddings:
+            first_embedding = embeddings[0]
+            first_values = getattr(first_embedding, "values", None)
+            if isinstance(first_values, list):
+                return [float(value) for value in first_values]
+
+        if isinstance(response, dict):
+            embedding_payload = response.get("embedding")
+            if isinstance(embedding_payload, dict):
+                values = embedding_payload.get("values")
+                if isinstance(values, list):
+                    return [float(value) for value in values]
+
+        return []

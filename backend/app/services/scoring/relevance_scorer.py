@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from math import sqrt
 
 from app.services.ai.embedding_service import EmbeddingService
+
+
+logger = logging.getLogger(__name__)
 
 
 class RelevanceScorer:
@@ -29,15 +34,41 @@ class RelevanceScorer:
         if cached_score is not None:
             return cached_score
 
-        post_embedding = await self.embedding_service.get_embedding(normalized_post)
-        niche_embedding = await self.embedding_service.get_embedding(normalized_niche)
+        post_embedding, niche_embedding = await self._embedding_pair(
+            normalized_post=normalized_post,
+            normalized_niche=normalized_niche,
+        )
         if not post_embedding or not niche_embedding:
-            return 0.0
+            lexical_score = self._lexical_similarity(normalized_post, normalized_niche)
+            self._cache[cache_key] = lexical_score
+            logger.info(
+                "Using lexical relevance fallback",
+                extra={"score": lexical_score},
+            )
+            return lexical_score
 
         cosine_similarity = self._cosine_similarity(post_embedding, niche_embedding)
         normalized_score = self._normalize_similarity(cosine_similarity)
         self._cache[cache_key] = normalized_score
         return normalized_score
+
+    async def _embedding_pair(
+        self,
+        normalized_post: str,
+        normalized_niche: str,
+    ) -> tuple[list[float], list[float]]:
+        """Fetch both embeddings and absorb provider failures into lexical fallback."""
+
+        try:
+            post_embedding = await self.embedding_service.get_embedding(normalized_post)
+            niche_embedding = await self.embedding_service.get_embedding(normalized_niche)
+        except Exception as exc:
+            logger.warning(
+                "Embedding relevance scoring failed; falling back to lexical similarity",
+                extra={"error": str(exc)},
+            )
+            return [], []
+        return post_embedding, niche_embedding
 
     def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
         """Compute cosine similarity between two embedding vectors."""
@@ -58,3 +89,22 @@ class RelevanceScorer:
 
         normalized = (similarity + 1.0) / 2.0
         return round(max(0.0, min(1.0, normalized)), 4)
+
+    def _lexical_similarity(self, post_text: str, niche_text: str) -> float:
+        """Score textual overlap when embeddings are unavailable."""
+
+        post_terms = self._tokenize(post_text)
+        niche_terms = self._tokenize(niche_text)
+        if not post_terms or not niche_terms:
+            return 0.0
+
+        shared_terms = post_terms.intersection(niche_terms)
+        overlap_ratio = len(shared_terms) / len(niche_terms)
+        phrase_bonus = 0.2 if niche_text.lower() in post_text.lower() else 0.0
+        specificity_bonus = min(0.15, len(shared_terms) * 0.03)
+        return round(max(0.0, min(1.0, overlap_ratio + phrase_bonus + specificity_bonus)), 4)
+
+    def _tokenize(self, text: str) -> set[str]:
+        """Split text into a lightweight token set for lexical matching."""
+
+        return {token for token in re.findall(r"[a-z0-9]{3,}", text.lower())}

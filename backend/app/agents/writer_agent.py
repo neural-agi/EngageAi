@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from app.core.memory_store import MemoryStore
 from app.services.ai.provider import AIProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 class WriterAgent:
@@ -63,8 +67,15 @@ class WriterAgent:
 
         context = context or {}
         prompt = self._build_prompt(normalized_post, context)
-        response = await self.provider.generate_structured(prompt)
-        variants = self._normalize_variants(response)
+        variants: list[dict[str, Any]] = []
+        try:
+            response = await self.provider.generate_structured(prompt)
+            variants = self._normalize_variants(response)
+        except Exception as exc:
+            logger.warning(
+                "Writer provider call failed; using fallback variants",
+                extra={"error": str(exc)},
+            )
         if variants:
             variants = self._deduplicate_variants(variants)
             variants = self._apply_style_rotation(variants, context)
