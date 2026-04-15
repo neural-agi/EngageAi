@@ -19,12 +19,16 @@ class Settings(BaseSettings):
     api_key: str | None = Field(default=None)
     api_rate_limit_per_minute: int = Field(default=60)
 
+    llm_provider: str = Field(default="openai")
     openai_api_key: str | None = Field(default=None)
+    gemini_api_key: str | None = Field(default=None)
     session_manager_secret: str | None = Field(default=None)
     database_url: str | None = Field(default=None)
     openai_base_url: str | None = Field(default=None)
     openai_model: str = Field(default="gpt-4o-mini")
     openai_embedding_model: str = Field(default="text-embedding-3-small")
+    gemini_model: str = Field(default="gemini-1.5-flash")
+    gemini_embedding_model: str = Field(default="models/text-embedding-004")
     ai_timeout_seconds: float = Field(default=30.0)
     ai_max_retries: int = Field(default=2)
     pipeline_timeout_seconds: float = Field(default=120.0)
@@ -51,9 +55,17 @@ def validate_required_settings(settings: Settings | None = None) -> Settings:
 
     settings = settings or get_settings()
     missing_variables: list[str] = []
+    llm_provider = settings.llm_provider.strip().lower() or "openai"
 
-    if not settings.openai_api_key:
+    if llm_provider not in {"openai", "gemini"}:
+        raise RuntimeError(
+            "Unsupported LLM_PROVIDER. Use 'openai' or 'gemini'."
+        )
+
+    if llm_provider == "openai" and not settings.openai_api_key:
         missing_variables.append("OPENAI_API_KEY")
+    if llm_provider == "gemini" and not settings.gemini_api_key:
+        missing_variables.append("GEMINI_API_KEY")
     if not settings.session_manager_secret:
         missing_variables.append("SESSION_MANAGER_SECRET")
     if not settings.api_key:

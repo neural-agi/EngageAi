@@ -7,3 +7,4 @@ celery
 redis
 psycopg[binary]>=3.2,<4.0
 openai
+google-generativeai

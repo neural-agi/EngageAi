@@ -14,6 +14,7 @@ from app.core.memory_store import MemoryStore
 from app.core.persona_engine import PersonaEngine
 from app.orchestrator.pipeline import EngagementPipeline
 from app.services.analytics.analytics_service import AnalyticsService
+from app.services.ai.provider import AIProvider
 from app.services.scraping.linkedin_scraper import LinkedInScraper
 from app.services.security.session_manager import SessionManager
 
@@ -156,7 +157,10 @@ class MockPipelineRunner:
             memory_store=memory_store,
             persona_engine=PersonaEngine(memory_store=memory_store),
             analyst=MockAnalystAgent(),
-            writer=WriterAgent(memory_store=memory_store),
+            writer=WriterAgent(
+                provider=AIProvider(disabled=True),
+                memory_store=memory_store,
+            ),
             critic=CriticAgent(),
             executor=ExecutorAgent(memory_store=memory_store),
             scraper_factory=scraper_factory,
