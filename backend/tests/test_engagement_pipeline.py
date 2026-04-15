@@ -89,6 +89,40 @@ class FakeScraper:
         ]
 
 
+class EmptyScraper:
+    """Return no posts to simulate an empty feed response."""
+
+    def __init__(self, session_cookies: list[dict[str, str]]) -> None:
+        self.session_cookies = session_cookies
+
+    async def fetch_feed(self) -> list[dict[str, Any]]:
+        return []
+
+
+class FailingScraper:
+    """Raise during feed fetching and expose a development fallback."""
+
+    def __init__(self, session_cookies: list[dict[str, str]]) -> None:
+        self.session_cookies = session_cookies
+
+    async def fetch_feed(self) -> list[dict[str, Any]]:
+        raise RuntimeError("scraper failed")
+
+    async def fetch_placeholder_real_data(self, max_posts: int = 20) -> list[dict[str, Any]]:
+        _ = max_posts
+        return [
+            {
+                "platform_post_id": "fallback-post",
+                "content": "Strong post about AI sales workflows and automation.",
+                "likes": 25,
+                "comments": 6,
+                "author": "Fallback Author",
+                "url": "https://example.com/fallback-post",
+                "hours_since_post": 1,
+            }
+        ]
+
+
 class FakeAnalyticsService:
     """Provide deterministic analytics output."""
 
@@ -276,3 +310,50 @@ def test_pipeline_run_continues_when_one_post_fails(monkeypatch) -> None:
     assert len(results) == 1
     assert results[0]["post"]["platform_post_id"] == "post-engage"
     assert results[0]["execution"]["status"] == "success"
+
+
+def test_pipeline_run_raises_when_no_posts_are_fetched(monkeypatch) -> None:
+    """Pipeline should fail clearly instead of returning a silent empty success."""
+
+    pipeline_module = _load_pipeline_module()
+    monkeypatch.setattr(pipeline_module, "LinkedInScraper", EmptyScraper)
+
+    pipeline = pipeline_module.EngagementPipeline()
+    pipeline.session_manager = FakeSessionManager()
+    pipeline.analytics = FakeAnalyticsService()
+    pipeline.analyst = FakeAnalystAgent()
+    pipeline.writer = FakeWriterAgent()
+    pipeline.critic = FakeCriticAgent()
+    pipeline.executor = FakeExecutorAgent()
+
+    try:
+        asyncio.run(pipeline.run(account_id="acct-empty", niche_text="AI sales"))
+    except RuntimeError as exc:
+        assert "No posts were fetched" in str(exc)
+    else:
+        raise AssertionError("Pipeline should raise when no posts are fetched.")
+
+
+def test_pipeline_run_uses_dev_fallback_when_scraper_fails(monkeypatch) -> None:
+    """Pipeline should use placeholder feed data only after a scraper failure in development."""
+
+    pipeline_module = _load_pipeline_module()
+    monkeypatch.setattr(pipeline_module, "LinkedInScraper", FailingScraper)
+
+    class DevelopmentSettings:
+        environment = "development"
+
+    monkeypatch.setattr(pipeline_module, "get_settings", lambda: DevelopmentSettings())
+
+    pipeline = pipeline_module.EngagementPipeline()
+    pipeline.session_manager = FakeSessionManager()
+    pipeline.analytics = FakeAnalyticsService()
+    pipeline.analyst = FakeAnalystAgent()
+    pipeline.writer = FakeWriterAgent()
+    pipeline.critic = FakeCriticAgent()
+    pipeline.executor = FakeExecutorAgent()
+
+    results = asyncio.run(pipeline.run(account_id="acct-dev", niche_text="AI sales"))
+
+    assert len(results) == 1
+    assert results[0]["post"]["platform_post_id"] == "fallback-post"

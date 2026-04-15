@@ -9,7 +9,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
+from pathlib import Path
 from typing import Dict, List
 
 
@@ -21,12 +23,23 @@ class SessionManager:
     Handles storage and retrieval of session cookies.
     """
 
-    def __init__(self):
-        self.storage_path = "./sessions"  # local storage for now
-        os.makedirs(self.storage_path, exist_ok=True)
+    def __init__(self, storage_path: str | None = None):
+        base_storage_path = (
+            Path(storage_path)
+            if storage_path
+            else Path(__file__).resolve().parents[3] / "data" / "sessions"
+        )
+        self.storage_path = base_storage_path.resolve()
+        self.storage_path.mkdir(parents=True, exist_ok=True)
 
-    def _get_file_path(self, account_id: str) -> str:
-        return os.path.join(self.storage_path, f"{account_id}.json")
+    def get_session_path(self, account_id: str) -> str:
+        """Return the absolute session file path for one account."""
+
+        return str(self._get_file_path(account_id))
+
+    def _get_file_path(self, account_id: str) -> Path:
+        normalized_account_id = self._normalize_account_id(account_id)
+        return self.storage_path / f"{normalized_account_id}.json"
 
     async def store_session(self, account_id: str, cookies: List[Dict]) -> None:
         """
@@ -37,11 +50,18 @@ class SessionManager:
         try:
             payload = self._encrypt_cookies(account_id, cookies)
             await asyncio.to_thread(self._write_payload, path, payload)
-            logger.info("Stored encrypted session cookies", extra={"account_id": account_id})
+            logger.info(
+                "Stored encrypted session cookies",
+                extra={
+                    "account_id": account_id,
+                    "path": str(path),
+                    "cookie_count": len(cookies),
+                },
+            )
         except Exception:
             logger.exception(
                 "Failed to store encrypted session cookies",
-                extra={"account_id": account_id},
+                extra={"account_id": account_id, "path": str(path)},
             )
             raise
 
@@ -51,19 +71,39 @@ class SessionManager:
         """
 
         path = self._get_file_path(account_id)
-        if not os.path.exists(path):
-            logger.info("Session file not found", extra={"account_id": account_id})
+        logger.info(
+            "Attempting to load session cookies",
+            extra={"account_id": account_id, "path": str(path)},
+        )
+        if not path.exists():
+            logger.warning(
+                "Session file not found",
+                extra={"account_id": account_id, "path": str(path)},
+            )
             return []
 
         try:
             payload = await asyncio.to_thread(self._read_payload, path)
             cookies = self._decrypt_cookies(account_id, payload)
-            logger.info("Loaded encrypted session cookies", extra={"account_id": account_id})
+            if cookies:
+                logger.info(
+                    "Loaded encrypted session cookies",
+                    extra={
+                        "account_id": account_id,
+                        "path": str(path),
+                        "cookie_count": len(cookies),
+                    },
+                )
+            else:
+                logger.warning(
+                    "Session file loaded but contained no cookies",
+                    extra={"account_id": account_id, "path": str(path)},
+                )
             return cookies
         except Exception:
             logger.exception(
                 "Failed to load encrypted session cookies",
-                extra={"account_id": account_id},
+                extra={"account_id": account_id, "path": str(path)},
             )
             return []
 
@@ -165,14 +205,21 @@ class SessionManager:
 
         return base64.urlsafe_b64decode(value.encode("utf-8"))
 
-    def _write_payload(self, path: str, payload: Dict[str, str | int]) -> None:
+    def _write_payload(self, path: Path, payload: Dict[str, str | int]) -> None:
         """Write encrypted payload to disk."""
 
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as file_handle:
             json.dump(payload, file_handle)
 
-    def _read_payload(self, path: str) -> Dict | List[Dict]:
+    def _read_payload(self, path: Path) -> Dict | List[Dict]:
         """Read encrypted payload from disk."""
 
         with open(path, "r", encoding="utf-8") as file_handle:
             return json.load(file_handle)
+
+    def _normalize_account_id(self, account_id: str) -> str:
+        """Normalize an account id into a filesystem-safe filename segment."""
+
+        sanitized_account_id = re.sub(r"[^A-Za-z0-9._-]", "_", account_id.strip())
+        return sanitized_account_id or "default"

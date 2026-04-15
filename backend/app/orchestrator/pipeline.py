@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any, Dict, List
 
 from app.agents.analyst_agent import AnalystAgent
+from app.config import get_settings
 from app.agents.critic_agent import CriticAgent
 from app.agents.executor_agent import ExecutorAgent
 from app.agents.writer_agent import WriterAgent
@@ -92,25 +93,45 @@ class EngagementPipeline:
         try:
             logger.info("Loading session cookies", extra={"account_id": account_id})
             cookies = await self.session_manager.get_session(account_id)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to load account session", extra={"account_id": account_id})
-            return []
+            raise RuntimeError(
+                f"Failed to load session cookies for account '{account_id}': {exc}"
+            ) from exc
 
         if not cookies:
-            logger.warning("No session cookies found for account", extra={"account_id": account_id})
+            session_path = self._session_path(account_id)
+            error_message = f"No session cookies found for account '{account_id}'."
+            if session_path:
+                error_message = f"{error_message} Expected session file at {session_path}."
+            logger.error(error_message, extra={"account_id": account_id})
+            raise RuntimeError(error_message)
+
+        logger.info(
+            "Session cookies loaded successfully",
+            extra={"account_id": account_id, "cookie_count": len(cookies)},
+        )
 
         scraper = self.scraper_factory(session_cookies=cookies)
 
         try:
             logger.info("Fetching feed posts", extra={"account_id": account_id})
             posts = await scraper.fetch_feed()
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to fetch feed posts", extra={"account_id": account_id})
-            return []
+            posts = await self._fallback_posts_on_scraper_failure(
+                scraper=scraper,
+                account_id=account_id,
+                error=exc,
+            )
 
         if not isinstance(posts, list) or not posts:
-            logger.info("No posts available for pipeline processing", extra={"account_id": account_id})
-            return []
+            error_message = (
+                f"No posts were fetched for account '{account_id}'. "
+                "The pipeline requires real input data or a development fallback after scraper failure."
+            )
+            logger.error(error_message, extra={"account_id": account_id})
+            raise RuntimeError(error_message)
 
         logger.info("Posts fetched: %s", len(posts), extra={"account_id": account_id, "count": len(posts)})
         results: list[dict[str, Any]] = []
@@ -213,6 +234,49 @@ class EngagementPipeline:
             extra={"account_id": account_id, "processed_results": len(results)},
         )
         return results
+
+    async def _fallback_posts_on_scraper_failure(
+        self,
+        scraper: Any,
+        account_id: str,
+        error: Exception,
+    ) -> list[dict[str, Any]]:
+        """Use placeholder posts only in non-production environments after scraper failure."""
+
+        environment = get_settings().environment.strip().lower()
+        if environment == "production":
+            raise RuntimeError(
+                f"Failed to fetch feed posts for account '{account_id}': {error}"
+            ) from error
+
+        fallback_loader = getattr(scraper, "fetch_placeholder_real_data", None)
+        if not callable(fallback_loader):
+            raise RuntimeError(
+                f"Failed to fetch feed posts for account '{account_id}' and no development fallback is available: {error}"
+            ) from error
+
+        logger.warning(
+            "Real scraper failed; using development fallback feed data",
+            extra={"account_id": account_id, "environment": environment, "error": str(error)},
+        )
+        fallback_posts = await fallback_loader()
+        logger.info(
+            "Development fallback returned posts",
+            extra={"account_id": account_id, "count": len(fallback_posts)},
+        )
+        return fallback_posts if isinstance(fallback_posts, list) else []
+
+    def _session_path(self, account_id: str) -> str | None:
+        """Return the resolved session path when the session manager exposes it."""
+
+        get_session_path = getattr(self.session_manager, "get_session_path", None)
+        if not callable(get_session_path):
+            return None
+        try:
+            return str(get_session_path(account_id))
+        except Exception:
+            logger.debug("Failed to resolve session path", extra={"account_id": account_id})
+            return None
 
     def _extract_post_text(self, post: dict[str, Any]) -> str:
         """Extract normalized text content from a scraped post payload."""
