@@ -21,6 +21,16 @@ from app.services.security.session_manager import SessionManager
 logger = logging.getLogger(__name__)
 
 
+class PipelineResults(list[dict[str, Any]]):
+    """List-like pipeline result payload with attached run metadata."""
+
+    def __init__(self, items: list[dict[str, Any]], mode: str) -> None:
+        """Store result items and one top-level execution mode."""
+
+        super().__init__(items)
+        self.mode = mode
+
+
 class EngagementPipeline:
     """Coordinate scraping, analysis, writing, and critique steps."""
 
@@ -80,6 +90,9 @@ class EngagementPipeline:
 
         selected_persona = self.persona_engine.select_persona(persona_name)
         run_style_usage: dict[str, int] = {}
+        pipeline_mode = "real"
+        fallback_used = False
+        scraper_status = "not_started"
         logger.info(
             "Selected pipeline persona",
             extra={
@@ -117,13 +130,17 @@ class EngagementPipeline:
         try:
             logger.info("Fetching feed posts", extra={"account_id": account_id})
             posts = await scraper.fetch_feed()
+            scraper_status = str(getattr(scraper, "last_fetch_metadata", {}).get("scraper_status", "success"))
         except Exception as exc:
             logger.exception("Failed to fetch feed posts", extra={"account_id": account_id})
-            posts = await self._fallback_posts_on_scraper_failure(
+            posts, fallback_used = await self._fallback_posts_on_scraper_failure(
                 scraper=scraper,
                 account_id=account_id,
                 error=exc,
             )
+            scraper_status = "fallback" if fallback_used else "failed"
+            if fallback_used:
+                pipeline_mode = "fallback"
 
         if not isinstance(posts, list) or not posts:
             error_message = (
@@ -133,9 +150,19 @@ class EngagementPipeline:
             logger.error(error_message, extra={"account_id": account_id})
             raise RuntimeError(error_message)
 
-        logger.info("Posts fetched: %s", len(posts), extra={"account_id": account_id, "count": len(posts)})
+        logger.info(
+            "Posts fetched: %s",
+            len(posts),
+            extra={
+                "account_id": account_id,
+                "count": len(posts),
+                "scraper_status": scraper_status,
+                "fallback_used": fallback_used,
+            },
+        )
         results: list[dict[str, Any]] = []
         posts_after_filtering = 0
+        candidate_posts: list[dict[str, Any]] = []
 
         for index, post in enumerate(posts, start=1):
             if not isinstance(post, dict):
@@ -165,33 +192,90 @@ class EngagementPipeline:
                     )
                     continue
                 posts_after_filtering += 1
-
-                logger.info("Generating comment variants", extra={"post_index": index})
-                variants = await self.writer.draft(
-                    post_text=post_text,
-                    context=self._build_writer_context(
-                        post,
-                        niche_text,
-                        viral_score,
-                        persona=selected_persona,
-                        style_usage=self._combine_style_usage(run_style_usage),
-                    ),
+                candidate_posts.append(
+                    {
+                        "index": index,
+                        "post": post,
+                        "post_text": post_text,
+                        "analysis": analysis,
+                        "viral_score": viral_score,
+                        "context": self._build_writer_context(
+                            post,
+                            niche_text,
+                            viral_score,
+                            persona=selected_persona,
+                            style_usage=self._combine_style_usage(run_style_usage),
+                        ),
+                    }
                 )
+            except Exception:
+                logger.exception("Failed to process post", extra={"post_index": index})
+                continue
+
+        logger.info(
+            "Posts after filtering: %s",
+            posts_after_filtering,
+            extra={
+                "account_id": account_id,
+                "count": posts_after_filtering,
+                "fallback_used": fallback_used,
+            },
+        )
+
+        batched_variants: dict[str, list[dict[str, Any]]] = {}
+        if candidate_posts and hasattr(self.writer, "draft_batch") and callable(getattr(self.writer, "draft_batch")):
+            logger.info(
+                "Generating batched comment variants",
+                extra={"account_id": account_id, "post_count": len(candidate_posts)},
+            )
+            batched_variants = await self.writer.draft_batch(
+                [
+                    {
+                        "post_id": self._post_id(candidate["post"], candidate["index"]),
+                        "post_text": candidate["post_text"],
+                        "context": candidate["context"],
+                    }
+                    for candidate in candidate_posts
+                ]
+            )
+
+        for candidate in candidate_posts:
+            post_index = int(candidate["index"])
+            post = candidate["post"]
+            analysis = candidate["analysis"]
+            embedding_status = str(analysis.get("embedding_status", "unknown"))
+            post_id = self._post_id(post, post_index)
+
+            try:
+                variants = batched_variants.get(post_id)
+                if variants is None:
+                    logger.info("Generating comment variants", extra={"post_index": post_index})
+                    variants = await self.writer.draft(
+                        post_text=candidate["post_text"],
+                        context=candidate["context"],
+                    )
                 if not variants:
-                    logger.info("No comment variants generated", extra={"post_index": index})
+                    logger.info("No comment variants generated", extra={"post_index": post_index})
                     continue
 
-                logger.info("Reviewing generated variants", extra={"post_index": index})
+                logger.info("Reviewing generated variants", extra={"post_index": post_index})
                 review = await self.critic.review(variants)
                 best_variant = review.get("best_variant")
                 ranked_variants = review.get("ranked_variants", [])
 
                 if not best_variant:
-                    logger.info("No approved variants after review", extra={"post_index": index})
+                    logger.info("No approved variants after review", extra={"post_index": post_index})
                     continue
 
+                result_mode = pipeline_mode
+                llm_status = str(best_variant.get("llm_status", "success"))
+                if best_variant.get("fallback_used"):
+                    result_mode = "degraded"
+                    llm_status = "fallback"
+                    fallback_used = True
+
                 self._record_style_selection(best_variant, run_style_usage)
-                logger.info("Executing best variant", extra={"post_index": index})
+                logger.info("Executing best variant", extra={"post_index": post_index})
                 execution_result = await self.executor.execute(
                     post_id=str(post.get("platform_post_id", "")),
                     comment={
@@ -199,11 +283,17 @@ class EngagementPipeline:
                         "persona": selected_persona,
                     },
                 )
+                if best_variant.get("fallback_used"):
+                    execution_result = {
+                        **execution_result,
+                        "warning": "LLM generation failed, using fallback content",
+                    }
                 logger.info(
                     "Execution step completed",
                     extra={
-                        "post_index": index,
+                        "post_index": post_index,
                         "execution_status": execution_result.get("status"),
+                        "fallback_used": bool(best_variant.get("fallback_used", False)),
                     },
                 )
 
@@ -212,35 +302,52 @@ class EngagementPipeline:
                         "post": post,
                         "analysis": analysis,
                         "analytics": {
-                            "viral_score": viral_score,
+                            "viral_score": candidate["viral_score"],
                         },
                         "best_comment": best_variant,
                         "ranked_comments": ranked_variants,
                         "execution": execution_result,
+                        "pipeline_metadata": {
+                            "mode": result_mode,
+                            "scraper_status": scraper_status,
+                            "llm_status": llm_status,
+                            "embedding_status": embedding_status,
+                            "fallback_used": fallback_used or bool(best_variant.get("fallback_used", False)),
+                        },
                     }
                 )
-                logger.info("Post processed successfully", extra={"post_index": index})
+                logger.info("Post processed successfully", extra={"post_index": post_index})
             except Exception:
-                logger.exception("Failed to process post", extra={"post_index": index})
+                logger.exception("Failed to process post", extra={"post_index": post_index})
                 continue
-
-        logger.info(
-            "Posts after filtering: %s",
-            posts_after_filtering,
-            extra={"account_id": account_id, "count": posts_after_filtering},
-        )
         logger.info(
             "Engagement pipeline completed",
-            extra={"account_id": account_id, "processed_results": len(results)},
+            extra={
+                "account_id": account_id,
+                "processed_results": len(results),
+                "fallback_used": fallback_used,
+                "scraper_status": scraper_status,
+            },
         )
-        return results
+        final_mode = pipeline_mode
+        for result in results:
+            metadata = result.get("pipeline_metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            result_mode = str(metadata.get("mode", "")).strip().lower()
+            if result_mode == "degraded":
+                final_mode = "degraded"
+                break
+            if result_mode == "fallback":
+                final_mode = "fallback"
+        return PipelineResults(results, mode=final_mode)
 
     async def _fallback_posts_on_scraper_failure(
         self,
         scraper: Any,
         account_id: str,
         error: Exception,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Use placeholder posts only in non-production environments after scraper failure."""
 
         environment = get_settings().environment.strip().lower()
@@ -257,14 +364,25 @@ class EngagementPipeline:
 
         logger.warning(
             "Real scraper failed; using development fallback feed data",
-            extra={"account_id": account_id, "environment": environment, "error": str(error)},
+            extra={
+                "account_id": account_id,
+                "environment": environment,
+                "error": str(error),
+                "scraper_status": "fallback",
+                "fallback_used": True,
+            },
         )
         fallback_posts = await fallback_loader()
         logger.info(
             "Development fallback returned posts",
-            extra={"account_id": account_id, "count": len(fallback_posts)},
+            extra={
+                "account_id": account_id,
+                "count": len(fallback_posts),
+                "scraper_status": "fallback",
+                "fallback_used": True,
+            },
         )
-        return fallback_posts if isinstance(fallback_posts, list) else []
+        return (fallback_posts if isinstance(fallback_posts, list) else [], True)
 
     def _session_path(self, account_id: str) -> str | None:
         """Return the resolved session path when the session manager exposes it."""
@@ -333,3 +451,11 @@ class EngagementPipeline:
 
         run_style_usage[style] = run_style_usage.get(style, 0) + 1
         self.memory_store.increment_style_usage(style)
+
+    def _post_id(self, post: dict[str, Any], index: int) -> str:
+        """Return one stable post identifier for internal batching."""
+
+        platform_post_id = str(post.get("platform_post_id", "")).strip()
+        if platform_post_id:
+            return platform_post_id
+        return f"post-{index}"

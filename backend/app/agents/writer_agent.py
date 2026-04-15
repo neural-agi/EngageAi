@@ -70,11 +70,15 @@ class WriterAgent:
         variants: list[dict[str, Any]] = []
         try:
             response = await self.provider.generate_structured(prompt)
-            variants = self._normalize_variants(response)
+            variants = self._tag_variants(self._normalize_variants(response), source="llm")
         except Exception as exc:
             logger.warning(
                 "Writer provider call failed; using fallback variants",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "llm_status": "failed",
+                    "fallback_used": True,
+                },
             )
         if variants:
             variants = self._deduplicate_variants(variants)
@@ -91,6 +95,50 @@ class WriterAgent:
             return combined_variants
 
         return []
+
+    async def draft_batch(
+        self,
+        items: list[dict[str, Any]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Generate variants for multiple posts in one provider call."""
+
+        normalized_items = self._normalize_batch_items(items)
+        if not normalized_items:
+            return {}
+
+        response_items: dict[str, list[dict[str, Any]]] = {}
+        try:
+            response = await self.provider.generate_structured(self._build_batch_prompt(normalized_items))
+            response_items = self._normalize_batch_response(response)
+        except Exception as exc:
+            logger.warning(
+                "Writer provider call failed; using fallback variants",
+                extra={
+                    "error": str(exc),
+                    "llm_status": "failed",
+                    "fallback_used": True,
+                },
+            )
+
+        batched_variants: dict[str, list[dict[str, Any]]] = {}
+        for item in normalized_items:
+            post_id = item["post_id"]
+            context = item["context"]
+            variants = self._tag_variants(response_items.get(post_id, []), source="llm")
+            if variants:
+                variants = self._deduplicate_variants(variants)
+                variants = self._apply_style_rotation(variants, context)
+
+            if len(variants) < 5:
+                fallback_variants = self._fallback_variants(item["post_text"], context)
+                fallback_variants = self._apply_style_rotation(fallback_variants, context)
+                variants = [*variants, *fallback_variants]
+
+            if variants:
+                self._remember_variants(variants)
+                batched_variants[post_id] = variants
+
+        return batched_variants
 
     def _build_prompt(self, post_text: str, context: dict[str, Any]) -> str:
         """Build a simple structured-generation prompt for comment variants."""
@@ -110,6 +158,67 @@ class WriterAgent:
             f"Context:\n{context}\n\n"
             f"Reference signals:\n{signals}"
         )
+
+    def _build_batch_prompt(self, items: list[dict[str, Any]]) -> str:
+        """Build one prompt that requests variants for multiple posts."""
+
+        prompt_items: list[str] = []
+        for item in items:
+            prompt_items.append(
+                "\n".join(
+                    [
+                        f"post_id: {item['post_id']}",
+                        f"post_text: {item['post_text']}",
+                        f"context: {item['context']}",
+                        f"signals: {self._extract_post_signals(item['post_text'], item['context'])}",
+                    ]
+                )
+            )
+
+        return (
+            "Generate LinkedIn comment variants as JSON with a top-level 'items' array. "
+            "Each item must contain 'post_id' and 'variants'. Each 'variants' array must contain 5 objects with "
+            "'text', 'style', and 'confidence'. Use these styles exactly once per post: question, insight, contrarian, bold statement, storytelling. "
+            "Each comment must directly reference its source post, stay concise, and avoid generic praise.\n\n"
+            + "\n\n".join(prompt_items)
+        )
+
+    def _normalize_batch_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Normalize one batched input payload."""
+
+        normalized_items: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            post_text = str(item.get("post_text", "")).strip()
+            if not post_text:
+                continue
+            normalized_items.append(
+                {
+                    "post_id": str(item.get("post_id", "")).strip() or f"post-{index}",
+                    "post_text": post_text,
+                    "context": item.get("context", {}) if isinstance(item.get("context"), dict) else {},
+                }
+            )
+        return normalized_items
+
+    def _normalize_batch_response(self, response: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+        """Normalize a batched provider response into a per-post mapping."""
+
+        raw_items = response.get("items")
+        if not isinstance(raw_items, list):
+            return {}
+
+        normalized_items: dict[str, list[dict[str, Any]]] = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            post_id = str(item.get("post_id", "")).strip()
+            variants = item.get("variants")
+            if not post_id or not isinstance(variants, list):
+                continue
+            normalized_items[post_id] = self._normalize_variants({"variants": variants})
+        return normalized_items
 
     def _normalize_variants(self, response: dict[str, Any]) -> list[dict[str, Any]]:
         """Normalize structured provider output into clean variant dictionaries."""
@@ -139,6 +248,10 @@ class WriterAgent:
                     "style": style,
                     "confidence": confidence,
                     "reference_terms": [str(term).strip() for term in reference_terms if str(term).strip()],
+                    "generation_source": str(item.get("generation_source", "")).strip() or "llm",
+                    "llm_status": str(item.get("llm_status", "")).strip() or "success",
+                    "fallback_used": bool(item.get("fallback_used", False)),
+                    "warning": str(item.get("warning", "")).strip() or None,
                 }
             )
 
@@ -226,7 +339,13 @@ class WriterAgent:
             },
         ]
 
-        variants = self._deduplicate_variants(raw_variants)
+        variants = self._deduplicate_variants(
+            self._tag_variants(
+                raw_variants,
+                source="fallback",
+                warning="LLM generation failed, using fallback content",
+            )
+        )
 
         # TODO: add quality scoring and ranking across generated variants.
         return variants
@@ -260,6 +379,10 @@ class WriterAgent:
                         for term in variant.get("reference_terms", [])
                         if str(term).strip()
                     ],
+                    "generation_source": str(variant.get("generation_source", "")).strip() or "llm",
+                    "llm_status": str(variant.get("llm_status", "")).strip() or "success",
+                    "fallback_used": bool(variant.get("fallback_used", False)),
+                    "warning": str(variant.get("warning", "")).strip() or None,
                 }
             )
 
@@ -303,6 +426,30 @@ class WriterAgent:
             )
 
         return adjusted_variants
+
+    def _tag_variants(
+        self,
+        variants: list[dict[str, Any]],
+        *,
+        source: str,
+        warning: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply consistent generation metadata to one variant list."""
+
+        tagged_variants: list[dict[str, Any]] = []
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            tagged_variants.append(
+                {
+                    **variant,
+                    "generation_source": source,
+                    "llm_status": "success" if source == "llm" else "failed",
+                    "fallback_used": source != "llm",
+                    "warning": warning if source != "llm" else str(variant.get("warning", "")).strip() or None,
+                }
+            )
+        return tagged_variants
 
     def _remember_variants(self, variants: list[dict[str, Any]]) -> None:
         """Persist generated comments so future runs can avoid reuse."""

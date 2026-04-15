@@ -30,6 +30,25 @@ except ImportError:  # pragma: no cover - runtime dependency
 logger = logging.getLogger(__name__)
 
 
+class LinkedInScraperError(RuntimeError):
+    """Raised when the LinkedIn scraper cannot fetch usable feed data."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_body: str | None = None,
+        url: str | None = None,
+    ) -> None:
+        """Store HTTP context for scraper failures."""
+
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+        self.url = url
+
+
 class LinkedInScraper:
     """Scrape LinkedIn feed content and interact with posts."""
 
@@ -48,6 +67,14 @@ class LinkedInScraper:
         self.selectors = {**self._default_selectors(), **(selectors or {})}
         self.headless = headless
         self.timeout_ms = timeout_ms
+        self.last_fetch_metadata: dict[str, Any] = {
+            "mode": "real",
+            "scraper_status": "not_started",
+            "fallback_used": False,
+            "status_code": None,
+            "response_body": None,
+            "attempts": 0,
+        }
 
         # TODO: load selectors from application configuration instead of passing them inline.
 
@@ -77,35 +104,87 @@ class LinkedInScraper:
         )
         if async_playwright is None:
             logger.warning(
-                "Playwright unavailable for real scraping. Install it with 'pip install playwright' and 'playwright install'."
+                "Playwright unavailable for real scraping. Install it with 'pip install playwright' and 'playwright install'.",
+                extra={"scraper_status": "unavailable", "fallback_used": False},
             )
-            raise RuntimeError("Playwright is not installed for real scraping.")
+            raise LinkedInScraperError("Playwright is not installed for real scraping.")
 
         if not self._has_required_selectors(required_selectors):
-            logger.warning("LinkedIn selectors are missing for real scraping")
-            raise RuntimeError("LinkedIn scraper selectors are not configured.")
+            logger.warning(
+                "LinkedIn selectors are missing for real scraping",
+                extra={"scraper_status": "misconfigured", "fallback_used": False},
+            )
+            raise LinkedInScraperError("LinkedIn scraper selectors are not configured.")
 
-        logger.info("Fetching LinkedIn feed posts", extra={"max_posts": max_posts})
-        try:
-            async with self._browser_session() as page:
-                await self._open_page(page, "https://www.linkedin.com/feed/")
-                posts = await self._collect_posts(
-                    page=page,
-                    post_selector=self.selectors["feed_post"],
-                    max_posts=max_posts,
+        logger.info(
+            "Fetching LinkedIn feed posts",
+            extra={
+                "max_posts": max_posts,
+                "cookie_count": len(self.session_cookies),
+                "has_li_at_cookie": self._has_cookie("li_at"),
+                "scraper_status": "starting",
+                "fallback_used": False,
+            },
+        )
+        retry_delays = (1.0, 2.0, 4.0)
+        last_error: Exception | None = None
+
+        for attempt in range(1, len(retry_delays) + 2):
+            self.last_fetch_metadata["attempts"] = attempt
+            try:
+                posts = await self._fetch_feed_once(max_posts=max_posts)
+                self.last_fetch_metadata.update(
+                    {
+                        "mode": "real",
+                        "scraper_status": "success" if posts else "empty",
+                        "fallback_used": False,
+                    }
                 )
                 logger.info(
                     "Posts fetched: %s",
                     len(posts),
-                    extra={"count": len(posts), "source": "real"},
+                    extra={
+                        "count": len(posts),
+                        "source": "real",
+                        "scraper_status": "success" if posts else "empty",
+                        "fallback_used": False,
+                        "attempt": attempt,
+                    },
                 )
                 return posts
-        except Exception as exc:
-            logger.exception(
-                "Failed to fetch LinkedIn feed",
-                extra={"error": str(exc), "source": "real"},
-            )
-            raise
+            except Exception as exc:
+                last_error = exc
+                status_code = exc.status_code if isinstance(exc, LinkedInScraperError) else None
+                response_body = exc.response_body if isinstance(exc, LinkedInScraperError) else None
+                self.last_fetch_metadata.update(
+                    {
+                        "scraper_status": "failed",
+                        "status_code": status_code,
+                        "response_body": response_body,
+                    }
+                )
+                logger.warning(
+                    "LinkedIn feed attempt failed",
+                    extra={
+                        "attempt": attempt,
+                        "max_attempts": len(retry_delays) + 1,
+                        "scraper_status": "failed",
+                        "fallback_used": False,
+                        "status_code": status_code,
+                        "response_body": response_body,
+                        "error": str(exc),
+                    },
+                )
+                if attempt > len(retry_delays):
+                    break
+                await asyncio.sleep(retry_delays[attempt - 1])
+
+        raise LinkedInScraperError(
+            f"Failed to fetch LinkedIn feed after {len(retry_delays) + 1} attempts: {last_error}",
+            status_code=self.last_fetch_metadata.get("status_code"),
+            response_body=self.last_fetch_metadata.get("response_body"),
+            url="https://www.linkedin.com/feed/",
+        ) from last_error
 
     async def fetch_placeholder_real_data(self, max_posts: int = 20) -> list[dict[str, Any]]:
         """Return structured placeholder posts until real selectors are fully configured."""
@@ -173,9 +252,43 @@ class LinkedInScraper:
         logger.info(
             "Posts fetched: %s",
             len(selected_posts),
-            extra={"count": len(selected_posts), "source": "placeholder"},
+            extra={
+                "count": len(selected_posts),
+                "source": "placeholder",
+                "scraper_status": "fallback",
+                "fallback_used": True,
+            },
         )
         return selected_posts
+
+    async def _fetch_feed_once(self, max_posts: int) -> list[dict[str, Any]]:
+        """Run one real feed-fetch attempt."""
+
+        async with self._browser_session() as page:
+            response = await self._open_page(page, "https://www.linkedin.com/feed/")
+            if self._looks_like_auth_redirect(page):
+                response_body = await self._page_snapshot(page)
+                raise LinkedInScraperError(
+                    "LinkedIn redirected away from the feed. Session cookies may be invalid.",
+                    status_code=getattr(response, "status", None) if response is not None else None,
+                    response_body=response_body,
+                    url=page.url,
+                )
+
+            posts = await self._collect_posts(
+                page=page,
+                post_selector=self.selectors["feed_post"],
+                max_posts=max_posts,
+            )
+            if not posts:
+                self.last_fetch_metadata.update(
+                    {
+                        "scraper_status": "empty",
+                        "status_code": getattr(response, "status", None) if response is not None else None,
+                        "response_body": await self._page_snapshot(page),
+                    }
+                )
+            return posts
 
     async def fetch_creator_posts(
         self,
@@ -286,7 +399,11 @@ class LinkedInScraper:
     async def _create_context(self, browser: Browser) -> BrowserContext:
         """Create a browser context and apply session cookies."""
 
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent=self._user_agent(),
+            extra_http_headers=self._request_headers(),
+            locale="en-US",
+        )
         if self.session_cookies:
             try:
                 await context.add_cookies(self.session_cookies)
@@ -295,13 +412,22 @@ class LinkedInScraper:
                 raise
         return context
 
-    async def _open_page(self, page: Page, url: str) -> None:
+    async def _open_page(self, page: Page, url: str) -> Any:
         """Open a page and wait for it to settle."""
 
         try:
-            await page.goto(url, wait_until="domcontentloaded")
+            response = await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
             await self._human_delay()
+            if response is not None and response.status >= 400:
+                response_body = await self._safe_response_text(response)
+                raise LinkedInScraperError(
+                    "LinkedIn feed request returned an error response.",
+                    status_code=response.status,
+                    response_body=response_body,
+                    url=url,
+                )
+            return response
         except PlaywrightTimeoutError:
             logger.warning("Timeout while opening page", extra={"url": url})
             raise
@@ -433,6 +559,68 @@ class LinkedInScraper:
         """Sleep for a randomized interval to avoid robotic interaction timing."""
 
         await asyncio.sleep(random.uniform(minimum, maximum))
+
+    def _request_headers(self) -> dict[str, str]:
+        """Return request headers for LinkedIn page navigation."""
+
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        csrf_token = self._csrf_token()
+        if csrf_token:
+            headers["csrf-token"] = csrf_token
+        return headers
+
+    def _csrf_token(self) -> str:
+        """Extract the LinkedIn CSRF token from cookies when present."""
+
+        for cookie in self.session_cookies:
+            if str(cookie.get("name", "")).strip() != "JSESSIONID":
+                continue
+            cookie_value = str(cookie.get("value", "")).strip()
+            return cookie_value.strip('"')
+        return ""
+
+    def _user_agent(self) -> str:
+        """Return a stable browser-like user agent."""
+
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+
+    def _has_cookie(self, cookie_name: str) -> bool:
+        """Return whether the current session has a named cookie."""
+
+        return any(str(cookie.get("name", "")).strip() == cookie_name for cookie in self.session_cookies)
+
+    def _looks_like_auth_redirect(self, page: Page) -> bool:
+        """Return whether the active page looks like a login or checkpoint redirect."""
+
+        current_url = (getattr(page, "url", "") or "").lower()
+        return "/login" in current_url or "checkpoint" in current_url or "/authwall" in current_url
+
+    async def _safe_response_text(self, response: Any) -> str:
+        """Return a short body snapshot from one HTTP response."""
+
+        try:
+            response_text = await response.text()
+        except Exception:
+            return ""
+        return " ".join(response_text.split())[:1000]
+
+    async def _page_snapshot(self, page: Page) -> str:
+        """Return a short page snapshot for diagnostics."""
+
+        try:
+            content = await page.content()
+        except Exception:
+            return ""
+        return " ".join(content.split())[:1000]
 
     def _default_selectors(self) -> dict[str, str]:
         """Return a best-effort selector map for current LinkedIn layouts."""

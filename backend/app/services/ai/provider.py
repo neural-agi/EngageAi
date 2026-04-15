@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 class AIProvider:
     """Async wrapper for low-level text, structured, and embedding calls."""
+
+    _gemini_rate_limit_lock = asyncio.Lock()
+    _last_gemini_request_at = 0.0
+    _gemini_retry_delays = (2.0, 5.0, 10.0)
 
     def __init__(
         self,
@@ -56,7 +61,7 @@ class AIProvider:
 
         if self.llm_provider == "gemini":
             operation = self._build_gemini_text_operation(cleaned_prompt)
-            max_attempts = 2
+            max_attempts = None
         else:
             operation = self._build_openai_text_operation(cleaned_prompt)
             max_attempts = None
@@ -90,13 +95,25 @@ class AIProvider:
         cleaned_text = text.strip()
         if not cleaned_text or self.disabled:
             return []
+        if not self.settings.use_embeddings:
+            logger.info(
+                "Embeddings disabled by configuration",
+                extra={
+                    "provider": self.llm_provider,
+                    "embedding_status": "disabled",
+                },
+            )
+            return []
         self._require_client()
 
-        logger.info("Generating embeddings with configured LLM provider", extra={"provider": self.llm_provider})
+        logger.info(
+            "Generating embeddings with configured LLM provider",
+            extra={"provider": self.llm_provider, "embedding_status": "requested"},
+        )
 
         if self.llm_provider == "gemini":
             operation = self._build_gemini_embedding_operation(cleaned_text)
-            max_attempts = 2
+            max_attempts = None
         else:
             operation = self._build_openai_embedding_operation(cleaned_text)
             max_attempts = None
@@ -194,10 +211,14 @@ class AIProvider:
         """Run an async operation with basic retries and timeout handling."""
 
         last_error: Exception | None = None
-        attempts = max(1, max_attempts if max_attempts is not None else self.max_retries + 1)
+        retry_delays = self._retry_delays(max_attempts=max_attempts)
+        attempts = len(retry_delays) + 1
+        status_key = "embedding_status" if operation_name == "get_embedding" else "llm_status"
 
         for attempt in range(attempts):
             try:
+                if self.llm_provider == "gemini":
+                    await self._throttle_gemini_requests()
                 result = await asyncio.wait_for(operation(), timeout=self.timeout_seconds)
                 logger.info(
                     "LLM provider call succeeded",
@@ -205,11 +226,13 @@ class AIProvider:
                         "provider": self.llm_provider,
                         "operation": operation_name,
                         "attempt": attempt + 1,
+                        status_key: "success",
                     },
                 )
                 return result
             except Exception as exc:  # pragma: no cover - depends on provider/runtime behavior
                 last_error = exc
+                error_status = "rate_limited" if self._is_rate_limit_error(exc) else "failed"
                 logger.warning(
                     "LLM provider call failed",
                     extra={
@@ -218,11 +241,12 @@ class AIProvider:
                         "attempt": attempt + 1,
                         "max_attempts": attempts,
                         "error": str(exc),
+                        status_key: error_status,
                     },
                 )
-                if attempt == attempts - 1:
+                if attempt >= len(retry_delays):
                     break
-                await asyncio.sleep(min(2**attempt, 3))
+                await asyncio.sleep(retry_delays[attempt])
 
         logger.error(
             "LLM provider call exhausted retries",
@@ -231,12 +255,39 @@ class AIProvider:
                 "operation": operation_name,
                 "retry_count": attempts,
                 "error": str(last_error) if last_error is not None else "unknown",
+                status_key: "failed",
             },
         )
         raise RuntimeError(
             f"{self.llm_provider} {operation_name} failed after {attempts} attempts: "
             f"{str(last_error) if last_error is not None else 'unknown error'}"
         ) from last_error
+
+    def _retry_delays(self, max_attempts: int | None) -> tuple[float, ...]:
+        """Return retry delays for the configured provider."""
+
+        if self.llm_provider == "gemini":
+            if max_attempts is not None:
+                return self._gemini_retry_delays[: max(0, max_attempts - 1)]
+            return self._gemini_retry_delays
+
+        attempts = max(1, max_attempts if max_attempts is not None else self.max_retries + 1)
+        return tuple(float(min(2**attempt, 3)) for attempt in range(max(0, attempts - 1)))
+
+    async def _throttle_gemini_requests(self) -> None:
+        """Ensure Gemini requests do not exceed one call per second in-process."""
+
+        async with self._gemini_rate_limit_lock:
+            elapsed = time.monotonic() - type(self)._last_gemini_request_at
+            if elapsed < 1.0:
+                await asyncio.sleep(1.0 - elapsed)
+            type(self)._last_gemini_request_at = time.monotonic()
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        """Return whether an exception looks like a rate-limit failure."""
+
+        error_text = str(exc).lower()
+        return "429" in error_text or "rate limit" in error_text or "too many requests" in error_text
 
     def _parse_json_object(self, content: str) -> dict[str, Any]:
         """Parse a JSON object response into a clean dictionary."""

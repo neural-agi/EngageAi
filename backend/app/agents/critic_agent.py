@@ -94,6 +94,10 @@ class CriticAgent:
                     "style": style,
                     "confidence": confidence,
                     "reference_terms": reference_terms if isinstance(reference_terms, list) else [],
+                    "generation_source": str(item.get("generation_source", "")).strip() or "llm",
+                    "llm_status": str(item.get("llm_status", "")).strip() or "success",
+                    "fallback_used": bool(item.get("fallback_used", False)),
+                    "warning": str(item.get("warning", "")).strip() or None,
                 }
             )
 

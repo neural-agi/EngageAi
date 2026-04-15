@@ -212,6 +212,11 @@ async def _execute_pipeline_background(
                     ),
                     timeout=timeout_seconds,
                 )
+                await asyncio.to_thread(
+                    tracker.update_mode,
+                    execution_id,
+                    _resolve_execution_mode(mock=mock, results=results),
+                )
                 await asyncio.to_thread(tracker.mark_completed, execution_id, results)
                 logger.info(
                     "Background pipeline execution completed",
@@ -312,3 +317,29 @@ def _get_execution_error_message(exc: Exception) -> str:
         return "Execution timed out"
 
     return str(exc).strip() or "Pipeline execution failed."
+
+
+def _resolve_execution_mode(mock: bool, results: list[dict[str, object]]) -> str:
+    """Resolve one execution mode from pipeline result metadata."""
+
+    if mock:
+        return "mock"
+
+    list_mode = getattr(results, "mode", None)
+    if isinstance(list_mode, str) and list_mode.strip():
+        return list_mode.strip().lower()
+
+    resolved_mode = "real"
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        metadata = result.get("pipeline_metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        result_mode = str(metadata.get("mode", "")).strip().lower()
+        if result_mode == "degraded":
+            return "degraded"
+        if result_mode == "fallback":
+            resolved_mode = "fallback"
+
+    return resolved_mode

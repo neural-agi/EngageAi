@@ -38,6 +38,7 @@ class AnalystAgent:
             "engagement_score": engagement_score,
             "final_score": final_score,
             "decision": self._make_decision(final_score),
+            "embedding_status": getattr(self.relevance_scorer, "last_embedding_status", "unknown"),
         }
 
     def _score_engagement(self, engagement_metrics: dict[str, Any]) -> float:

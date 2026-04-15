@@ -213,6 +213,28 @@ class ExecutionTracker:
             sqlite_params=(error_message, now, now, execution_id),
         )
 
+    def update_mode(self, execution_id: str, mode: str) -> None:
+        """Update one execution mode label."""
+
+        normalized_mode = self._mode(mode)
+        now = self._timestamp()
+        self._execute(
+            """
+            UPDATE pipeline_executions
+            SET mode = $2,
+                updated_at = CAST($3 AS TIMESTAMPTZ)
+            WHERE execution_id = $1
+            """,
+            """
+            UPDATE pipeline_executions
+            SET mode = ?,
+                updated_at = ?
+            WHERE execution_id = ?
+            """,
+            postgres_params=(execution_id, normalized_mode, now),
+            sqlite_params=(normalized_mode, now, execution_id),
+        )
+
     def get_execution(self, execution_id: str) -> dict[str, Any] | None:
         """Return one execution record with parsed results."""
 
@@ -547,9 +569,12 @@ class ExecutionTracker:
 
         return self.database_config.mode == "postgres"
 
-    def _mode(self, mock: bool) -> str:
+    def _mode(self, mock: bool | str) -> str:
         """Return the normalized execution mode label."""
 
+        if isinstance(mock, str):
+            normalized_mode = mock.strip().lower()
+            return normalized_mode or "real"
         return "mock" if mock else "real"
 
     def _timestamp(self) -> str:

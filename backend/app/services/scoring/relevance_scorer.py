@@ -20,6 +20,7 @@ class RelevanceScorer:
 
         self.embedding_service = embedding_service or EmbeddingService()
         self._cache: dict[tuple[str, str], float] = {}
+        self.last_embedding_status = "unknown"
 
     async def score_relevance(self, post_text: str, niche_text: str) -> float:
         """Return a normalized relevance score in the range ``0..1``."""
@@ -43,13 +44,14 @@ class RelevanceScorer:
             self._cache[cache_key] = lexical_score
             logger.info(
                 "Using lexical relevance fallback",
-                extra={"score": lexical_score},
+                extra={"score": lexical_score, "embedding_status": self.last_embedding_status},
             )
             return lexical_score
 
         cosine_similarity = self._cosine_similarity(post_embedding, niche_embedding)
         normalized_score = self._normalize_similarity(cosine_similarity)
         self._cache[cache_key] = normalized_score
+        self.last_embedding_status = "success"
         return normalized_score
 
     async def _embedding_pair(
@@ -59,15 +61,26 @@ class RelevanceScorer:
     ) -> tuple[list[float], list[float]]:
         """Fetch both embeddings and absorb provider failures into lexical fallback."""
 
+        provider = getattr(self.embedding_service, "provider", None)
+        provider_settings = getattr(provider, "settings", None)
+        if provider_settings is not None and not getattr(provider_settings, "use_embeddings", True):
+            self.last_embedding_status = "disabled"
+            return [], []
+
         try:
             post_embedding = await self.embedding_service.get_embedding(normalized_post)
             niche_embedding = await self.embedding_service.get_embedding(normalized_niche)
         except Exception as exc:
+            self.last_embedding_status = "fallback"
             logger.warning(
                 "Embedding relevance scoring failed; falling back to lexical similarity",
-                extra={"error": str(exc)},
+                extra={"error": str(exc), "embedding_status": self.last_embedding_status},
             )
             return [], []
+        if not post_embedding or not niche_embedding:
+            self.last_embedding_status = "fallback"
+        else:
+            self.last_embedding_status = "success"
         return post_embedding, niche_embedding
 
     def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
