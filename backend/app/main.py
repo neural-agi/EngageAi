@@ -48,9 +48,14 @@ async def lifespan(app: FastAPI):
         logger.error("Database initialization failed", extra={"error": str(exc)})
         raise
 
-    app.state.database_status = "ok"
+    app.state.database_status = "disabled" if database_config.mode == "memory-only" else "ok"
     app.state.database_mode = database_config.mode
-    if database_config.mode == "sqlite-dev":
+    if database_config.mode == "memory-only":
+        logger.warning(
+            "Database not configured, running in memory-only mode",
+            extra={"database_description": database_config.description},
+        )
+    elif database_config.mode == "sqlite-dev":
         logger.warning(
             "Running without PostgreSQL (dev mode only)",
             extra={"database_description": database_config.description},

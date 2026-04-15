@@ -138,6 +138,16 @@ def get_db() -> Generator[Any, None, None]:
 def init_db(settings: Settings | None = None) -> DatabaseConfig:
     """Validate database connectivity and return the resolved configuration."""
 
+    settings = settings or get_settings()
+    configured_url = (settings.database_url or "").strip()
+    if not configured_url:
+        logger.warning("Database not configured, running in memory-only mode")
+        return DatabaseConfig(
+            mode="memory-only",
+            url="",
+            description="Database not configured; startup connection check skipped.",
+        )
+
     ok, database_config, error_message = test_database_connection(settings=settings)
     if not ok:
         raise RuntimeError(error_message or "Database connection check failed.")

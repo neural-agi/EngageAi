@@ -60,8 +60,6 @@ def validate_required_settings(settings: Settings | None = None) -> Settings:
         missing_variables.append("API_KEY")
     environment = settings.environment.strip().lower()
     if environment == "production":
-        if not settings.database_url:
-            missing_variables.append("DATABASE_URL")
         if not settings.backend_cors_origins.strip():
             missing_variables.append("BACKEND_CORS_ORIGINS")
 
