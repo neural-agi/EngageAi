@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import uvicorn
 
@@ -21,6 +22,7 @@ def main() -> None:
 
     settings = get_settings()
     configure_logging(settings.log_level)
+    raw_port = (os.environ.get("PORT") or "").strip()
 
     try:
         validate_required_settings(settings)
@@ -31,19 +33,28 @@ def main() -> None:
         )
         raise SystemExit(1) from exc
 
+    try:
+        port = int(raw_port) if raw_port else settings.backend_port
+    except ValueError as exc:
+        logger.error(
+            "Backend startup aborted because PORT is invalid",
+            extra={"port": raw_port},
+        )
+        raise SystemExit(1) from exc
+
     logger.info(
         "Launching uvicorn server",
         extra={
             "entrypoint": "main:app",
             "host": settings.backend_host,
-            "port": settings.backend_port,
+            "port": port,
             "environment": settings.environment,
         },
     )
     uvicorn.run(
         "main:app",
         host=settings.backend_host,
-        port=settings.backend_port,
+        port=port,
         reload=False,
     )
 

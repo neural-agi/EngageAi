@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -72,7 +73,7 @@ async def lifespan(app: FastAPI):
             "app_name": validated_settings.app_name,
             "environment": validated_settings.environment,
             "backend_host": validated_settings.backend_host,
-            "backend_port": validated_settings.backend_port,
+            "backend_port": (os.environ.get("PORT") or "").strip() or validated_settings.backend_port,
             "database_mode": database_config.mode,
         },
     )
