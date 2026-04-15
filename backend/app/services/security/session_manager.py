@@ -37,6 +37,49 @@ class SessionManager:
 
         return str(self._get_file_path(account_id))
 
+    def session_exists(self, account_id: str) -> bool:
+        """Return whether a session file already exists for one account."""
+
+        return self._get_file_path(account_id).exists()
+
+    async def ensure_session_from_env(
+        self,
+        account_id: str,
+        encoded_session_json: str | None,
+    ) -> int:
+        """Write a session file from an encoded environment payload when missing."""
+
+        from app.config import decode_session_json
+
+        path = self._get_file_path(account_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if path.exists():
+            logger.info(
+                "Runtime session file already exists",
+                extra={"account_id": account_id, "path": str(path)},
+            )
+            return 0
+
+        cookies = decode_session_json(encoded_session_json)
+        if not cookies:
+            logger.info(
+                "No runtime session payload provided for bootstrap",
+                extra={"account_id": account_id, "path": str(path)},
+            )
+            return 0
+
+        await self.store_session(account_id, cookies)
+        logger.info(
+            "Runtime session file created from SESSION_JSON",
+            extra={
+                "account_id": account_id,
+                "path": str(path),
+                "cookie_count": len(cookies),
+            },
+        )
+        return len(cookies)
+
     def _get_file_path(self, account_id: str) -> Path:
         normalized_account_id = self._normalize_account_id(account_id)
         return self.storage_path / f"{normalized_account_id}.json"

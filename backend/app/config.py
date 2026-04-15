@@ -1,5 +1,7 @@
 """Application configuration and environment validation."""
 
+import base64
+import json
 from functools import lru_cache
 
 from pydantic import Field
@@ -29,6 +31,7 @@ class Settings(BaseSettings):
     openai_embedding_model: str = Field(default="text-embedding-3-small")
     gemini_model: str = Field(default="gemini-2.0-flash")
     gemini_embedding_model: str = Field(default="text-embedding-004")
+    session_json: str | None = Field(default=None)
     ai_timeout_seconds: float = Field(default=30.0)
     ai_max_retries: int = Field(default=2)
     pipeline_timeout_seconds: float = Field(default=120.0)
@@ -95,3 +98,26 @@ def get_cors_origins(settings: Settings | None = None) -> list[str]:
         if origin.strip()
     ]
     return configured_origins
+
+
+def decode_session_json(session_json: str | None) -> list[dict]:
+    """Decode a base64-encoded session JSON payload into a cookie list."""
+
+    encoded_value = (session_json or "").strip()
+    if not encoded_value:
+        return []
+
+    try:
+        decoded_bytes = base64.b64decode(encoded_value)
+    except Exception as exc:
+        raise RuntimeError("SESSION_JSON is not valid base64.") from exc
+
+    try:
+        payload = json.loads(decoded_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("SESSION_JSON did not decode into valid JSON.") from exc
+
+    if not isinstance(payload, list):
+        raise RuntimeError("SESSION_JSON must decode into a JSON array of cookies.")
+
+    return [cookie for cookie in payload if isinstance(cookie, dict)]

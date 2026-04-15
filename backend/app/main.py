@@ -16,6 +16,7 @@ from app.database import init_db
 from app.observability.logging import configure_logging
 from app.routers.campaigns import pipeline_router, router as campaigns_router
 from app.routers.health import router as health_router
+from app.services.security.session_manager import SessionManager
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,34 @@ async def lifespan(app: FastAPI):
             "Database connection verified",
             extra={"database_description": database_config.description},
         )
+
+    session_manager = SessionManager()
+    session_directory = session_manager.storage_path
+    session_directory.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Session storage directory ready",
+        extra={"path": str(session_directory)},
+    )
+    try:
+        injected_cookie_count = await session_manager.ensure_session_from_env(
+            account_id="test",
+            encoded_session_json=validated_settings.session_json,
+        )
+        if injected_cookie_count:
+            logger.info(
+                "Session bootstrap completed",
+                extra={
+                    "account_id": "test",
+                    "path": session_manager.get_session_path("test"),
+                    "cookie_count": injected_cookie_count,
+                },
+            )
+    except RuntimeError as exc:
+        logger.error(
+            "Session bootstrap failed",
+            extra={"account_id": "test", "error": str(exc)},
+        )
+        raise
 
     logger.info(
         "Starting FastAPI application",
