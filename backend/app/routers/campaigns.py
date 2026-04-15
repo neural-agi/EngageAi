@@ -7,7 +7,7 @@ import logging
 from time import monotonic
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 
 import run_pipeline as pipeline_runner
 from app.config import get_settings
@@ -21,7 +21,6 @@ from app.schemas.campaign import (
 from app.schemas.common import ApiMessage
 from app.services.behavior.execution_tracker import ExecutionLimitExceededError
 from app.services.behavior.execution_tracker import ExecutionTracker
-from app.services.security.api_access import require_api_access
 
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
@@ -41,11 +40,10 @@ async def create_campaign(payload: CampaignCreate) -> ApiMessage:
 async def run_campaign_pipeline(
     payload: PipelineRequest,
     background_tasks: BackgroundTasks,
-    _api_key: str = Depends(require_api_access),
 ) -> PipelineStartResponse:
     """Run the campaign pipeline."""
 
-    _ = _api_key
+    # TODO: re-enable authentication before production.
     return await _start_pipeline_execution(payload, background_tasks)
 
 
@@ -53,22 +51,20 @@ async def run_campaign_pipeline(
 async def run_pipeline(
     payload: PipelineRequest,
     background_tasks: BackgroundTasks,
-    _api_key: str = Depends(require_api_access),
 ) -> PipelineStartResponse:
     """Run the engagement pipeline from a top-level endpoint."""
 
-    _ = _api_key
+    # TODO: re-enable authentication before production.
     return await _start_pipeline_execution(payload, background_tasks)
 
 
 @pipeline_router.get("/execution/{execution_id}", response_model=ExecutionStatusResponse)
 async def get_execution_status(
     execution_id: str,
-    _api_key: str = Depends(require_api_access),
 ) -> ExecutionStatusResponse:
     """Return the status and results for a background execution."""
 
-    _ = _api_key
+    # TODO: re-enable authentication before production.
     tracker = await asyncio.to_thread(ExecutionTracker)
     execution = await asyncio.to_thread(tracker.get_execution, execution_id)
     if execution is None:
@@ -81,11 +77,10 @@ async def get_execution_status(
 async def list_executions(
     account_id: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1),
-    _api_key: str = Depends(require_api_access),
 ) -> list[ExecutionListItemResponse]:
     """Return recent executions for one account."""
 
-    _ = _api_key
+    # TODO: re-enable authentication before production.
     normalized_account_id = (account_id or "").strip()
     if not normalized_account_id:
         raise HTTPException(status_code=400, detail="account_id is required")

@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.config import get_cors_origins, get_settings, validate_required_settings
+from app.config import get_settings, validate_required_settings
 from app.database import init_db
 from app.observability.logging import configure_logging
 from app.routers.campaigns import pipeline_router, router as campaigns_router
@@ -87,7 +87,7 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=get_cors_origins(),
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
